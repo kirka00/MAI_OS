@@ -2,6 +2,11 @@
 .Trash
 Thumbs.db
 desktop.ini
+.venv
+*.py
+*.csv
+*main
+*py
 
 *.o
 *.obj
