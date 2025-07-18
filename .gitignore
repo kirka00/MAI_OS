@@ -49,8 +49,6 @@ build/
 cmake-build-*/
 CMakeFiles/
 CMakeCache.txt
-Makefile
-makefile
 compile_commands.json
 *.mk
 
