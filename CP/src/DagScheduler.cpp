@@ -24,7 +24,21 @@ bool DAGScheduler::load_from_yaml(const string &filename)
             {
                 job.should_fail = node["fail"].as<bool>();
             }
+            if (m_jobs.count(job.id))
+            {
+                cerr << "Ошибка: дублирующийся id джоба: " << job.id << endl;
+                return false;
+            }
             m_jobs[job.id] = job;
+        }
+
+        // Строим список смежности: id → кто от него зависит
+        for (const auto &[id, job] : m_jobs)
+        {
+            for (int dep_id : job.dependencies)
+            {
+                m_adjacency[dep_id].push_back(id);
+            }
         }
 
         return validate_dag();
@@ -46,12 +60,25 @@ void DAGScheduler::run()
     m_should_stop = false;
     vector<thread> worker_threads;
     // Основной цикл: продолжается, пока есть незавершенные задачи
-    while (!all_jobs_done())
+    while (true)
     {
+        // Проверяем состояние под мьютексом, чтобы избежать гонки данных
+        {
+            lock_guard<mutex> lock(m_mutex);
+            if (all_jobs_done())
+                break;
+        }
         // Если задача не выполнилась, нам нужно прекратить планирование новых задач
         if (m_should_stop)
         {
             cout << "\n--- ОБНАРУЖЕНА ОШИБКА! ЗАПРОС НА ОСТАНОВКУ ---" << endl;
+            // Отменяем все незапущенные задачи
+            lock_guard<mutex> lock(m_mutex);
+            for (auto &[id, job] : m_jobs)
+            {
+                if (job.status == JobStatus::PENDING)
+                    job.status = JobStatus::CANCELLED;
+            }
             break;
         }
         vector<int> ready_jobs;
@@ -66,11 +93,15 @@ void DAGScheduler::run()
                     ready_jobs.push_back(id);
                 }
             }
+            // Устанавливаем статус RUNNING под тем же мьютексом
+            for (int id : ready_jobs)
+            {
+                m_jobs[id].status = JobStatus::RUNNING;
+            }
         }
         // Запускаем новый поток для каждой готовой задачи
         for (int id : ready_jobs)
         {
-            m_jobs[id].status = JobStatus::RUNNING;
             worker_threads.emplace_back(&DAGScheduler::execute_job, this, id);
         }
         // Небольшая пауза, чтобы предотвратить активное ожидание и высокую загрузку процессора
@@ -147,25 +178,22 @@ bool DAGScheduler::is_cyclic_util(int id, set<int> &visited, set<int> &recursion
 {
     visited.insert(id);
     recursion_stack.insert(id);
-    // Находим всех соседей (задачи, которые зависят от текущей задачи)
-    for (const auto &[job_id, job_node] : m_jobs)
+    // Находим всех соседей через список смежности (задачи, которые зависят от текущей)
+    if (m_adjacency.count(id))
     {
-        for (int dep_id : job_node.dependencies)
+        for (int neighbor : m_adjacency.at(id))
         {
-            if (dep_id == id)
-            { // job_node зависит от id
-                // Если сосед уже находится в стеке рекурсии, значит, у нас есть цикл
-                if (recursion_stack.count(job_id))
+            // Если сосед уже находится в стеке рекурсии, значит, у нас есть цикл
+            if (recursion_stack.count(neighbor))
+            {
+                return true; // Цикл найден
+            }
+            // Если сосед еще не посещен, рекурсивно вызываем для него
+            if (!visited.count(neighbor))
+            {
+                if (is_cyclic_util(neighbor, visited, recursion_stack))
                 {
-                    return true; // Цикл найден
-                }
-                // Если сосед еще не посещен, рекурсивно вызываем для него
-                if (!visited.count(job_id))
-                {
-                    if (is_cyclic_util(job_id, visited, recursion_stack))
-                    {
-                        return true;
-                    }
+                    return true;
                 }
             }
         }
@@ -192,6 +220,7 @@ bool DAGScheduler::check_for_single_component()
 void DAGScheduler::dfs_connectivity(int start_node, set<int> &visited)
 {
     visited.insert(start_node);
+    // Проход по зависимостям (рёбра «к предкам»)
     for (int dep_id : m_jobs.at(start_node).dependencies)
     {
         if (visited.find(dep_id) == visited.end())
@@ -199,13 +228,14 @@ void DAGScheduler::dfs_connectivity(int start_node, set<int> &visited)
             dfs_connectivity(dep_id, visited);
         }
     }
-    for (const auto &[id, job] : m_jobs)
+    // Проход по зависимым через список смежности (рёбра «к потомкам»)
+    if (m_adjacency.count(start_node))
     {
-        for (int dep_id : job.dependencies)
+        for (int neighbor : m_adjacency.at(start_node))
         {
-            if (dep_id == start_node && visited.find(id) == visited.end())
+            if (visited.find(neighbor) == visited.end())
             {
-                dfs_connectivity(id, visited);
+                dfs_connectivity(neighbor, visited);
             }
         }
     }
@@ -259,11 +289,9 @@ bool DAGScheduler::check_for_start_and_end_jobs()
 
 void DAGScheduler::execute_job(int id)
 {
-    Job &current_job = m_jobs.at(id);
-
     {
         lock_guard<mutex> lock(m_mutex);
-        cout << "[ЗАПУСК] Джоб " << id << ": " << current_job.name << endl;
+        cout << "[ЗАПУСК] Джоб " << id << ": " << m_jobs.at(id).name << endl;
     }
     // Имитация работы со случайной задержкой
     random_device rd;
@@ -273,25 +301,26 @@ void DAGScheduler::execute_job(int id)
     // Проверяем, не был ли получен сигнал остановки (например, из-за сбоя другой задачи)
     if (m_should_stop)
     {
-        current_job.status = JobStatus::CANCELLED;
         lock_guard<mutex> lock(m_mutex);
-        cout << "[ОТМЕНЕН] Джоб " << id << ": " << current_job.name << endl;
+        m_jobs.at(id).status = JobStatus::CANCELLED;
+        cout << "[ОТМЕНЕН] Джоб " << id << ": " << m_jobs.at(id).name << endl;
         return;
     }
     // Имитация сбоя задачи
-    if (current_job.should_fail)
     {
-        current_job.status = JobStatus::FAILED;
-        // Посылаем сигнал всем остальным потокам на остановку
-        m_should_stop = true;
         lock_guard<mutex> lock(m_mutex);
-        cerr << "[ОШИБКА] Джоб " << id << ": " << current_job.name << " завершился сбоем!" << endl;
-    }
-    else
-    {
-        current_job.status = JobStatus::COMPLETED;
-        lock_guard<mutex> lock(m_mutex);
-        cout << "[УСПЕХ] Джоб " << id << ": " << current_job.name << endl;
+        if (m_jobs.at(id).should_fail)
+        {
+            m_jobs.at(id).status = JobStatus::FAILED;
+            // Посылаем сигнал всем остальным потокам на остановку
+            m_should_stop = true;
+            cerr << "[ОШИБКА] Джоб " << id << ": " << m_jobs.at(id).name << " завершился сбоем!" << endl;
+        }
+        else
+        {
+            m_jobs.at(id).status = JobStatus::COMPLETED;
+            cout << "[УСПЕХ] Джоб " << id << ": " << m_jobs.at(id).name << endl;
+        }
     }
 }
 
